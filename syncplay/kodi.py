@@ -1,5 +1,8 @@
+import os
 from datetime import timedelta
+from urllib.parse import unquote, urlparse
 
+import xbmcvfs
 from xbmc import Player, sleep
 from xbmcgui import Dialog
 
@@ -8,11 +11,33 @@ from syncplay.socket import connect, disconnect
 from syncplay.util import gs, gsi, gsb  # Added gs and gsb imports
 
 
+def _filemeta(path: str) -> tuple:
+    if not path:
+        return ("", 0)
+
+    # Strip query string for URLs and decode percent-encoding so the
+    # filename matches what other Syncplay clients see on disk.
+    name = os.path.basename(unquote(urlparse(path).path) if "://" in path else path)
+
+    try:
+        size = int(xbmcvfs.File(path).size())
+    except Exception:
+        size = 0
+
+    return (name, size)
+
+
 class _Player(Player):
     def onAVStarted(self):
+        path = self.getPlayingFile() if self.isPlaying() else ""
+        name, size = _filemeta(path)
+        # Fall back to the media-tag title if we somehow have no filename.
+        if not name:
+            name = self.getVideoInfoTag().getTitle()
         set.dispatch({
             "duration": self.getTotalTime(),
-            "name": self.getVideoInfoTag().getTitle()
+            "name": name,
+            "size": size
         })
         set.dispatch({"ready": True})
         state.dispatch(0.0, False, False)
