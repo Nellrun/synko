@@ -2,7 +2,17 @@ from time import time
 
 from syncplay.kodi import player, setplaystate
 from syncplay.socket import send
-from syncplay.util import getrtt, gs, gsi, gsb  # Added gsb import
+from syncplay.util import getrtt, gs, gsi, gsb
+
+# synko runs in follow-only mode: we never volunteer our own playback
+# position to the room. Every State we send carries the LAST authoritative
+# server position back. This means the server can never decide we're "behind"
+# and yank everyone backwards via RewindOnDesync. The leader (someone with a
+# real Syncplay client) drives position; we just react to what they do.
+#
+# We still broadcast pause/unpause as user-initiated actions — those are real
+# intent. We do NOT broadcast local seeks; the next server pulse will simply
+# pull us back to the room's position.
 
 _cstate = {
     "ping": {
@@ -16,31 +26,20 @@ _cstate = {
     }
 }
 seeking = False
-# True while we're seeking the local player to catch the room up. Read by
-# kodi.onPlayBackSeek so it doesn't echo our own catch-up seek back to the
-# server as a client-initiated seek (which would broadcast our possibly stale
-# getTime() to everyone).
+# Set by setplaystate before a catch-up seek so onPlayBackSeek can ignore the
+# resulting Kodi callback instead of echoing it back to the server.
 syncing_to_server = False
 
 
 def update_local(position: float = 0.0, paused: bool = False):
-    """Update local playstate without sending anything to the server.
-
-    Used at playback start: the next server pulse will pick this up and let
-    state.handle() sync us forward to the room's position via getTime() diff.
-    Sending a State with ignoringOnTheFly={client:1} here would instead make
-    the room snap to *our* position (0.0), dragging everyone back to start.
-    """
+    """Update local state without sending anything to the server."""
     _cstate["playstate"]["position"] = max(0.0, position)
     _cstate["playstate"]["paused"] = paused
 
 
 def _setping(sping: dict):
-    # Just return this to server, it'll handle generation too.
     _cstate["ping"]["latencyCalculation"] = sping["latencyCalculation"]
-    # Server will return this and generation will be handled here.
     _cstate["ping"]["clientLatencyCalculation"] = time()
-    # Server needs to acknowledge our CLC and send an RTT for us to calculate ours.
     if "clientLatencyCalculation" in sping:
         _cstate["ping"]["clientRtt"] = getrtt(
             sping["clientLatencyCalculation"],
@@ -48,109 +47,92 @@ def _setping(sping: dict):
         )
 
 
+def _local_position() -> float:
+    """Where Kodi actually is right now. Used only to decide whether to
+    catch up locally, NEVER reported back to the server."""
+    if not player.isPlaying():
+        return 0.0
+    t = player.getTime()
+    return 0.0 if t < 0 else t
+
+
 def handle(sstate: dict):
     _setping(sstate["ping"])
 
-    if player.isPlaying():
-        curtime = player.getTime()
-        _cstate["playstate"]["position"] = 0.0 if curtime < 0 else curtime
-    else:
-        # No file loaded — echo the server's position instead of reporting 0.0.
-        # Otherwise the server sees us "behind" the room and (with rewind-on-desync)
-        # drags everyone back to 0:00, e.g. right after a Kodi restart.
-        _cstate["playstate"]["position"] = sstate["playstate"]["position"]
-        _cstate["playstate"]["paused"] = sstate["playstate"]["paused"]
+    # Always echo server position. This is the heart of follow-only mode —
+    # we never tell the room "I'm at X". We tell it "I agree, I'm where you
+    # said the room is".
+    server_position = sstate["playstate"]["position"]
+    _cstate["playstate"]["position"] = server_position
 
     if "ignoringOnTheFly" in sstate:
         iotf = sstate["ignoringOnTheFly"]
-        # If server is asking for a change
         if "server" in iotf:
-            _cstate["ignoringOnTheFly"] = {
-                "server": iotf["server"]
-            }
+            _cstate["ignoringOnTheFly"] = {"server": iotf["server"]}
             if sstate["playstate"]["setBy"] != gs("user"):
-                setplaystate(sstate["playstate"], _cstate["playstate"])
-                # Kodi is slow, help it out (playstate doesn't update fast enough)
+                setplaystate(sstate["playstate"], {
+                    "position": _local_position(),
+                    "paused": _cstate["playstate"]["paused"]
+                })
                 _cstate["playstate"]["paused"] = sstate["playstate"]["paused"]
-                _cstate["playstate"]["position"] = sstate["playstate"]["position"]
-        # If another client has already requested a change
-        elif "client" in sstate["ignoringOnTheFly"]:
-            setplaystate(sstate["playstate"], _cstate["playstate"])
-            # Match what we'll be at after the seek, so the State we send back
-            # to the server doesn't still report the pre-seek position.
-            _cstate["playstate"]["position"] = sstate["playstate"]["position"]
+        elif "client" in iotf:
+            setplaystate(sstate["playstate"], {
+                "position": _local_position(),
+                "paused": _cstate["playstate"]["paused"]
+            })
             _cstate["playstate"]["paused"] = sstate["playstate"]["paused"]
             del _cstate["ignoringOnTheFly"]
-    # Delete iotf if its not sent by the server and we don't have an iotf
     elif "ignoringOnTheFly" in _cstate and "client" not in _cstate["ignoringOnTheFly"]:
         del _cstate["ignoringOnTheFly"]
-    # Don't check for time difference if we are seeking
-    elif not seeking:
-        # Calculate time difference (positive = we're behind, negative = we're ahead)
-        diff = sstate["playstate"]["position"] - _cstate["playstate"]["position"]
-        tolerance_ms = float(gsi("tolerance"))
-        tolerance_seconds = tolerance_ms / 1000
-        
-        # Get rewind threshold from settings with fallback
+    elif not seeking and player.isPlaying():
+        # Compare Kodi's actual position against the room and catch up locally
+        # if needed. This is purely a local decision; nothing about the diff
+        # is reported back to the server.
+        actual = _local_position()
+        diff = server_position - actual
+        tolerance_seconds = float(gsi("tolerance")) / 1000
+
         try:
             rewind_threshold_setting = gs("rewindThreshold")
             rewind_threshold = float(rewind_threshold_setting) if rewind_threshold_setting else 3.0
         except:
             rewind_threshold = 3.0
-        
-        # Ensure rewind threshold is at least 2x tolerance
         rewind_threshold = max(tolerance_seconds * 2, rewind_threshold)
-        
-        # Check if rewind is disabled
+
         try:
             rewind_disabled = gsb("disableRewind")
         except:
             rewind_disabled = False
-        
-        # Add network latency compensation
+
         rtt_compensation = _cstate["ping"]["clientRtt"] / 2 if _cstate["ping"]["clientRtt"] > 0 else 0
         effective_tolerance = tolerance_seconds + rtt_compensation
-        
-        # Only perform sync actions if difference is significant
-        if abs(diff) > effective_tolerance:
-            synced = False
-            # If we're behind by more than tolerance, sync forward
-            if diff > effective_tolerance:
-                setplaystate(sstate["playstate"], _cstate["playstate"])
-                synced = True
-            # If we're ahead by more than rewind threshold, sync backward (only if rewind not disabled)
-            elif diff < -rewind_threshold and not rewind_disabled:
-                setplaystate(sstate["playstate"], _cstate["playstate"])
-                synced = True
-            # If we're only slightly ahead (between tolerance and rewind threshold), ignore
-            # This prevents constant micro-rewinds that cause the annoying behavior
 
-            # After triggering a catch-up seek, optimistically advance our
-            # local position to where Kodi will land. Otherwise the send() at
-            # the end of this function reports the stale pre-seek position
-            # back to the server, which (in RewindOnDesync mode) interprets
-            # that as us still being behind and rewinds the whole room.
-            if synced:
-                _cstate["playstate"]["position"] = sstate["playstate"]["position"]
+        if abs(diff) > effective_tolerance:
+            cps = {"position": actual, "paused": _cstate["playstate"]["paused"]}
+            if diff > effective_tolerance:
+                setplaystate(sstate["playstate"], cps)
+            elif diff < -rewind_threshold and not rewind_disabled:
+                setplaystate(sstate["playstate"], cps)
 
     send({"State": _cstate})
 
 
 def dispatch(position: float, paused: bool, seeked: bool):
+    """Broadcast a user-initiated state change to the room.
+
+    Position is intentionally NOT taken from the caller — we always send the
+    last server position so we don't accidentally drive the room. The only
+    thing this actually broadcasts is the pause/unpause toggle.
+    """
     if "ignoringOnTheFly" in _cstate:
         return
 
-    _cstate["playstate"]["position"] = position
     if seeked:
-        _cstate["playstate"]["paused"] = _cstate["playstate"]["paused"]
-        _cstate["playstate"]["doSeek"] = seeked
-    else:
-        _cstate["playstate"]["paused"] = paused
+        # Local seeks are not broadcast in follow-only mode. The next server
+        # pulse will pull Kodi back to the room's position via setplaystate.
+        return
 
+    _cstate["playstate"]["paused"] = paused
     _cstate["ignoringOnTheFly"] = {"client": 1}
 
     send({"State": _cstate})
-
-    # Clear this, since state is stored globally
-    if seeked:
-        del _cstate["playstate"]["doSeek"]

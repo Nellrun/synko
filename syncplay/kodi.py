@@ -55,21 +55,12 @@ class _Player(Player):
         state.dispatch(self.getTime(), False, False)
 
     def onPlayBackSeek(self, _t, _o):
-        # Kodi is slow, dispatch needs to get current time
-        # which doesn't update fast enough when seek is called.
-        # More useful if something is seeking from a stream.
-        # Set this bool to make seeking super reliable.
+        # In follow-only mode, local seeks aren't broadcast — state.dispatch
+        # with seeked=True is a no-op. The `seeking` flag is still set briefly
+        # so state.handle() doesn't fight us with a catch-up seek mid-jump.
         state.seeking = True
         sleep(gsi("seek"))
-        if state.syncing_to_server:
-            # This seek was triggered by setplaystate catching us up to the
-            # room. Don't re-broadcast it as a client-initiated seek — getTime()
-            # might still be stale, and a client-iotf with position 0 would
-            # tell the server "this user just seeked to 0", dragging everyone
-            # back to the start.
-            state.syncing_to_server = False
-        else:
-            state.dispatch(self.getTime(), False, True)
+        state.syncing_to_server = False
         state.seeking = False
 
     # Rejoin to show that nothing is playing.
