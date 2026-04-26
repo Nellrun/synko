@@ -40,7 +40,11 @@ class _Player(Player):
             "size": size
         })
         set.dispatch({"ready": True})
-        state.dispatch(0.0, False, False)
+        # Update local state silently — the next server pulse will sync us
+        # forward to the room. Don't dispatch a client-iotf State here, or
+        # the server will broadcast our position (0.0) as a seek and drag
+        # everyone back to the start of the file.
+        state.update_local(self.getTime() if self.isPlaying() else 0.0, False)
 
     def onPlayBackPaused(self):
         set.dispatch({"ready": False})

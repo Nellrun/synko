@@ -18,6 +18,18 @@ _cstate = {
 seeking = False
 
 
+def update_local(position: float = 0.0, paused: bool = False):
+    """Update local playstate without sending anything to the server.
+
+    Used at playback start: the next server pulse will pick this up and let
+    state.handle() sync us forward to the room's position via getTime() diff.
+    Sending a State with ignoringOnTheFly={client:1} here would instead make
+    the room snap to *our* position (0.0), dragging everyone back to start.
+    """
+    _cstate["playstate"]["position"] = max(0.0, position)
+    _cstate["playstate"]["paused"] = paused
+
+
 def _setping(sping: dict):
     # Just return this to server, it'll handle generation too.
     _cstate["ping"]["latencyCalculation"] = sping["latencyCalculation"]
