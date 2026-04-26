@@ -1,3 +1,8 @@
+import json
+
+import xbmc
+import xbmcvfs
+from xbmc import Player
 from xbmcgui import Dialog
 
 from syncplay.socket import send
@@ -32,12 +37,16 @@ def handle(info: dict):
                 "{} {}".format(name, event),
                 sound=False
             )
-        elif "file" in info:
+        # Check `file` independently of `event` — when joining a room the server
+        # may send both keys in one Set:user payload, and we want to handle the
+        # file in either case.
+        if "file" in info:
             Dialog().notification(
                 "Syncplay",
                 "{} is playing {}".format(name, info["file"]["name"]),
                 sound=False
             )
+            _maybe_open_match(name, info["file"])
     elif "ready" in info:
         info = info["ready"]
         if info["username"] == gs("user"):
@@ -46,7 +55,7 @@ def handle(info: dict):
             "Syncplay",
             "{} is {}ready".format(
                 info["username"], "" if info["isReady"] else "not "
-            ), 
+            ),
             sound=False
         )
     elif "playlistChange" in info:
@@ -58,3 +67,67 @@ def handle(info: dict):
             "{} changed the playlist".format(info["user"]),
             sound=False
         )
+
+
+def _maybe_open_match(other_user: str, file_info: dict):
+    """If the other user's file exists in our library, offer to open it."""
+    # Don't interrupt an active session — only catch up when we're idle.
+    if Player().isPlaying():
+        return
+
+    name = file_info.get("name", "")
+    if not name:
+        return
+
+    expected_size = int(file_info.get("size") or 0)
+    path = _find_in_library(name, expected_size)
+    if not path:
+        xbmc.log("Syncplay: no library match for '{}'".format(name), xbmc.LOGINFO)
+        return
+
+    if Dialog().yesno(
+        "Syncplay",
+        "{} is watching:\n{}\n\nOpen the local copy?".format(other_user, name)
+    ):
+        Player().play(path)
+
+
+def _find_in_library(name: str, expected_size: int) -> str:
+    """Look up a file in Kodi's VideoLibrary by exact filename, optionally size."""
+    queries = [
+        ("VideoLibrary.GetEpisodes", "episodes"),
+        ("VideoLibrary.GetMovies", "movies"),
+    ]
+
+    for method, result_key in queries:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": {
+                "filter": {"field": "filename", "operator": "is", "value": name},
+                "properties": ["file"]
+            },
+            "id": 1
+        }
+        try:
+            response = json.loads(xbmc.executeJSONRPC(json.dumps(payload)))
+        except Exception as e:
+            xbmc.log("Syncplay: library query failed: {}".format(e), xbmc.LOGWARNING)
+            continue
+
+        for item in response.get("result", {}).get(result_key, []) or []:
+            path = item.get("file", "")
+            if not path:
+                continue
+            # Size match guarantees same release. If we don't know the size or
+            # can't stat the file, fall through and accept the name match alone.
+            if expected_size:
+                try:
+                    actual_size = int(xbmcvfs.File(path).size())
+                    if actual_size and actual_size != expected_size:
+                        continue
+                except Exception:
+                    pass
+            return path
+
+    return ""
