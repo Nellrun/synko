@@ -34,8 +34,15 @@ def _setping(sping: dict):
 def handle(sstate: dict):
     _setping(sstate["ping"])
 
-    curtime = player.getTime() if player.isPlaying() else 0.0
-    _cstate["playstate"]["position"] = 0.0 if curtime < 0 else curtime
+    if player.isPlaying():
+        curtime = player.getTime()
+        _cstate["playstate"]["position"] = 0.0 if curtime < 0 else curtime
+    else:
+        # No file loaded — echo the server's position instead of reporting 0.0.
+        # Otherwise the server sees us "behind" the room and (with rewind-on-desync)
+        # drags everyone back to 0:00, e.g. right after a Kodi restart.
+        _cstate["playstate"]["position"] = sstate["playstate"]["position"]
+        _cstate["playstate"]["paused"] = sstate["playstate"]["paused"]
 
     if "ignoringOnTheFly" in sstate:
         iotf = sstate["ignoringOnTheFly"]
