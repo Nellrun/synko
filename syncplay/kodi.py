@@ -61,7 +61,15 @@ class _Player(Player):
         # Set this bool to make seeking super reliable.
         state.seeking = True
         sleep(gsi("seek"))
-        state.dispatch(self.getTime(), False, True)
+        if state.syncing_to_server:
+            # This seek was triggered by setplaystate catching us up to the
+            # room. Don't re-broadcast it as a client-initiated seek — getTime()
+            # might still be stale, and a client-iotf with position 0 would
+            # tell the server "this user just seeked to 0", dragging everyone
+            # back to the start.
+            state.syncing_to_server = False
+        else:
+            state.dispatch(self.getTime(), False, True)
         state.seeking = False
 
     # Rejoin to show that nothing is playing.
@@ -95,6 +103,7 @@ def setplaystate(sps: dict, cps: dict):
     
     # Handle explicit seeks (when someone manually seeks)
     if "doSeek" in sps and sps["doSeek"]:
+        state.syncing_to_server = True
         player.seekTime(sps["position"])
         Dialog().notification(
             "Syncplay",
@@ -128,6 +137,7 @@ def setplaystate(sps: dict, cps: dict):
         
         if diff > tolerance_seconds:
             # We're behind - seek forward to server position
+            state.syncing_to_server = True
             player.seekTime(sps["position"])
             Dialog().notification(
                 "Syncplay",
@@ -136,6 +146,7 @@ def setplaystate(sps: dict, cps: dict):
             )
         elif diff < -rewind_threshold and not rewind_disabled:
             # We're way ahead - seek back to server position (only if rewind not disabled)
+            state.syncing_to_server = True
             player.seekTime(sps["position"])
             Dialog().notification(
                 "Syncplay",

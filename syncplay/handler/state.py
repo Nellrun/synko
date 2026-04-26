@@ -16,6 +16,11 @@ _cstate = {
     }
 }
 seeking = False
+# True while we're seeking the local player to catch the room up. Read by
+# kodi.onPlayBackSeek so it doesn't echo our own catch-up seek back to the
+# server as a client-initiated seek (which would broadcast our possibly stale
+# getTime() to everyone).
+syncing_to_server = False
 
 
 def update_local(position: float = 0.0, paused: bool = False):
@@ -71,6 +76,10 @@ def handle(sstate: dict):
         # If another client has already requested a change
         elif "client" in sstate["ignoringOnTheFly"]:
             setplaystate(sstate["playstate"], _cstate["playstate"])
+            # Match what we'll be at after the seek, so the State we send back
+            # to the server doesn't still report the pre-seek position.
+            _cstate["playstate"]["position"] = sstate["playstate"]["position"]
+            _cstate["playstate"]["paused"] = sstate["playstate"]["paused"]
             del _cstate["ignoringOnTheFly"]
     # Delete iotf if its not sent by the server and we don't have an iotf
     elif "ignoringOnTheFly" in _cstate and "client" not in _cstate["ignoringOnTheFly"]:
@@ -104,14 +113,25 @@ def handle(sstate: dict):
         
         # Only perform sync actions if difference is significant
         if abs(diff) > effective_tolerance:
+            synced = False
             # If we're behind by more than tolerance, sync forward
             if diff > effective_tolerance:
                 setplaystate(sstate["playstate"], _cstate["playstate"])
+                synced = True
             # If we're ahead by more than rewind threshold, sync backward (only if rewind not disabled)
             elif diff < -rewind_threshold and not rewind_disabled:
                 setplaystate(sstate["playstate"], _cstate["playstate"])
+                synced = True
             # If we're only slightly ahead (between tolerance and rewind threshold), ignore
             # This prevents constant micro-rewinds that cause the annoying behavior
+
+            # After triggering a catch-up seek, optimistically advance our
+            # local position to where Kodi will land. Otherwise the send() at
+            # the end of this function reports the stale pre-seek position
+            # back to the server, which (in RewindOnDesync mode) interprets
+            # that as us still being behind and rewinds the whole room.
+            if synced:
+                _cstate["playstate"]["position"] = sstate["playstate"]["position"]
 
     send({"State": _cstate})
 
