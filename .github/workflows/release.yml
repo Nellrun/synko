@@ -1,0 +1,110 @@
+name: Build & publish Kodi repo
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'addon.xml'
+      - 'addon.py'
+      - 'syncplay/**'
+      - 'resources/**'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  ADDON_ID: script.service.syncplay
+  REPO_ID: repository.nellrun.synko
+  REPO_VER: "1.0.0"
+  PAGES_URL: https://nellrun.github.io/synko
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read addon version
+        id: meta
+        run: |
+          ver=$(grep -m1 'version=' addon.xml | sed -E 's/.*version="([^"]+)".*/\1/')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Building $ADDON_ID v$ver"
+
+      - name: Build addon zip
+        run: |
+          VER=${{ steps.meta.outputs.version }}
+          mkdir -p staging/$ADDON_ID
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='dist' \
+            --exclude='staging*' \
+            --exclude='*.zip' \
+            --exclude='.gitignore' \
+            ./ staging/$ADDON_ID/
+          mkdir -p dist/$ADDON_ID
+          (cd staging && zip -r ../dist/$ADDON_ID/$ADDON_ID-$VER.zip $ADDON_ID)
+          cp addon.xml dist/$ADDON_ID/addon.xml
+          cp resources/icon.png dist/$ADDON_ID/icon.png 2>/dev/null || true
+          cp resources/fanart.png dist/$ADDON_ID/fanart.png 2>/dev/null || true
+
+      - name: Build repository addon
+        run: |
+          mkdir -p staging-repo/$REPO_ID
+          cat > staging-repo/$REPO_ID/addon.xml <<EOF
+          <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+          <addon id="$REPO_ID" name="Nellrun Synko Repo" version="$REPO_VER" provider-name="nellrun">
+            <extension point="xbmc.addon.repository" name="Nellrun Synko Repo">
+              <dir>
+                <info compressed="false">$PAGES_URL/addons.xml</info>
+                <checksum>$PAGES_URL/addons.xml.md5</checksum>
+                <datadir zip="true">$PAGES_URL/</datadir>
+              </dir>
+            </extension>
+            <extension point="xbmc.addon.metadata">
+              <summary lang="en">Nellrun's Synko Repository</summary>
+              <description lang="en">Auto-updating repository for the Synko Kodi add-on.</description>
+              <platform>all</platform>
+            </extension>
+          </addon>
+          EOF
+          mkdir -p dist/$REPO_ID
+          (cd staging-repo && zip -r ../dist/$REPO_ID/$REPO_ID-$REPO_VER.zip $REPO_ID)
+          cp staging-repo/$REPO_ID/addon.xml dist/$REPO_ID/addon.xml
+
+      - name: Generate addons.xml + md5
+        run: |
+          {
+            echo '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            echo '<addons>'
+            sed -n '/<addon /,/<\/addon>/p' dist/$ADDON_ID/addon.xml
+            sed -n '/<addon /,/<\/addon>/p' dist/$REPO_ID/addon.xml
+            echo '</addons>'
+          } > dist/addons.xml
+          md5sum dist/addons.xml | awk '{print $1}' > dist/addons.xml.md5
+          echo "---- addons.xml ----"
+          cat dist/addons.xml
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

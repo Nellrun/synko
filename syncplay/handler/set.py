@@ -19,6 +19,16 @@ _search_lock = threading.Lock()
 _search_thread: threading.Thread = None  # type: ignore
 _searched_names = set()
 
+# Track which other room members currently have a file open. Used by the state
+# handler to skip catch-up seeks when nobody else is actually playing — without
+# this we'd see `server.position=0` from a passive room and yank ourselves back
+# to the start of the movie.
+_others_with_file: dict = {}
+
+
+def any_other_playing() -> bool:
+    return bool(_others_with_file)
+
 
 def dispatch(args: dict):
     if "ready" in args:
@@ -42,21 +52,30 @@ def handle(info: dict):
             return
         info = info[name]
         if "event" in info:
-            event = "joined" if "joined" in info["event"] else "left"
+            event_kind = "joined" if "joined" in info["event"] else "left"
             Dialog().notification(
                 "Syncplay",
-                "{} {}".format(name, event),
+                "{} {}".format(name, event_kind),
                 sound=False
             )
+            if event_kind == "left":
+                _others_with_file.pop(name, None)
         # Check `file` independently of `event` — when joining a room the server
         # may send both keys in one Set:user payload.
         if "file" in info:
-            Dialog().notification(
-                "Syncplay",
-                "{} is playing {}".format(name, info["file"]["name"]),
-                sound=False
-            )
-            _maybe_open_match(name, info["file"])
+            file_info = info["file"]
+            # An empty `name` in the file payload means the user closed their
+            # file. Anything else means they have something open.
+            if file_info.get("name"):
+                _others_with_file[name] = file_info
+                Dialog().notification(
+                    "Syncplay",
+                    "{} is playing {}".format(name, file_info["name"]),
+                    sound=False
+                )
+                _maybe_open_match(name, file_info)
+            else:
+                _others_with_file.pop(name, None)
     elif "ready" in info:
         info = info["ready"]
         if info["username"] == gs("user"):

@@ -1,5 +1,6 @@
 from time import time
 
+from syncplay.handler.set import any_other_playing
 from syncplay.kodi import player, setplaystate
 from syncplay.socket import send
 from syncplay.util import getrtt, gs, gsi, gsb
@@ -84,10 +85,14 @@ def handle(sstate: dict):
             del _cstate["ignoringOnTheFly"]
     elif "ignoringOnTheFly" in _cstate and "client" not in _cstate["ignoringOnTheFly"]:
         del _cstate["ignoringOnTheFly"]
-    elif not seeking and player.isPlaying():
+    elif not seeking and player.isPlaying() and any_other_playing():
         # Compare Kodi's actual position against the room and catch up locally
         # if needed. This is purely a local decision; nothing about the diff
         # is reported back to the server.
+        #
+        # Only sync when somebody else in the room actually has a file open.
+        # Otherwise the server's `position` is stale/zero from a passive room,
+        # and we'd ping-pong our own playback against an imaginary leader.
         actual = _local_position()
         diff = server_position - actual
         tolerance_seconds = float(gsi("tolerance")) / 1000
