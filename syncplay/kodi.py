@@ -1,6 +1,6 @@
 import os
 from datetime import timedelta
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import xbmcvfs
 from xbmc import Player, sleep
@@ -11,16 +11,59 @@ from syncplay.socket import connect, disconnect
 from syncplay.util import gs, gsi, gsb  # Added gs and gsb imports
 
 
-def _filemeta(path: str) -> tuple:
-    if not path:
-        return ("", 0)
+def _display_title(player: Player) -> str:
+    """Readable name built from Kodi's metadata for the current playing item."""
+    try:
+        tag = player.getVideoInfoTag()
+    except Exception:
+        return ""
 
-    # Strip query string for URLs and decode percent-encoding so the
-    # filename matches what other Syncplay clients see on disk.
-    name = os.path.basename(unquote(urlparse(path).path) if "://" in path else path)
+    show = tag.getTVShowTitle()
+    if show:
+        parts = [show]
+        season, episode = tag.getSeason(), tag.getEpisode()
+        if season > 0 and episode > 0:
+            parts.append("S{:02d}E{:02d}".format(season, episode))
+        ep_title = tag.getTitle()
+        if ep_title and ep_title != show:
+            parts.append("- " + ep_title)
+        return " ".join(parts)
+
+    title = tag.getTitle()
+    if not title:
+        return ""
+    year = tag.getYear()
+    return "{} ({})".format(title, year) if year else title
+
+
+def _filename_from_query(parsed) -> str:
+    """Debrid services (Torbox, Real-Debrid, etc.) put the real release name
+    in a `filename=` query param while the URL path is a UUID."""
+    qs = parse_qs(parsed.query)
+    for key in ("filename", "name"):
+        values = qs.get(key)
+        if values and values[0]:
+            return unquote(values[0])
+    return ""
+
+
+def _filemeta(path: str, title: str = "") -> tuple:
+    is_url = bool(path) and "://" in path and not path.startswith("file://")
+
+    if is_url:
+        parsed = urlparse(path)
+        # Order of preference: filename= query param → Kodi metadata title →
+        # URL basename. The query param wins because it carries the actual
+        # release name (e.g. From.S04E03.2160p.AMZN.WEB-DL.H.265.mkv) that
+        # other Syncplay clients need for filename-based matching.
+        name = _filename_from_query(parsed) or title or os.path.basename(unquote(parsed.path))
+    elif path:
+        name = os.path.basename(path)
+    else:
+        name = title
 
     try:
-        size = int(xbmcvfs.File(path).size())
+        size = int(xbmcvfs.File(path).size()) if path else 0
     except Exception:
         size = 0
 
@@ -30,10 +73,7 @@ def _filemeta(path: str) -> tuple:
 class _Player(Player):
     def onAVStarted(self):
         path = self.getPlayingFile() if self.isPlaying() else ""
-        name, size = _filemeta(path)
-        # Fall back to the media-tag title if we somehow have no filename.
-        if not name:
-            name = self.getVideoInfoTag().getTitle()
+        name, size = _filemeta(path, _display_title(self))
         set.dispatch({
             "duration": self.getTotalTime(),
             "name": name,
