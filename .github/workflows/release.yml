@@ -36,8 +36,12 @@ jobs:
         id: meta
         run: |
           set -eux
-          ver=$(grep -m1 'version=' addon.xml | sed -E 's/.*version="([^"]+)".*/\1/')
+          # Match version= on the <addon ...> line specifically — grepping for
+          # bare `version=` also hits the `<?xml version="1.0" ?>` prolog and
+          # silently picks the wrong number.
+          ver=$(grep -m1 '<addon ' addon.xml | sed -E 's/.*version="([^"]+)".*/\1/')
           test -n "$ver"
+          echo "Addon version: $ver"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
       - name: Build addon zip
