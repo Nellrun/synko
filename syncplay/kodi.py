@@ -1,4 +1,6 @@
 import os
+import re
+import urllib.request
 from datetime import timedelta
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -49,6 +51,33 @@ _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".m2ts", ".webm",
                ".wmv", ".flv", ".mpg", ".mpeg")
 
 
+def _filename_from_headers(url: str, timeout: float = 4.0) -> str:
+    """Ask the CDN for the file's name via Content-Disposition.
+
+    TorBox and similar CDNs only expose it on a real GET (not HEAD), so we
+    pull the first byte with Range to avoid downloading anything substantial.
+    """
+    if not url or "://" not in url or url.startswith("file://"):
+        return ""
+    try:
+        req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            cd = resp.headers.get("Content-Disposition", "")
+    except Exception as e:
+        xbmc.log("synko: Content-Disposition probe failed: {}".format(e), xbmc.LOGWARNING)
+        return ""
+    if not cd:
+        return ""
+    # RFC 5987 encoded form: filename*=UTF-8''Encoded%20Name
+    m = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", cd, re.I)
+    if m:
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"?([^";]+?)"?\s*(?:;|$)', cd, re.I)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def _filename_from_url(url: str) -> str:
     """Extract a usable filename from a URL.
 
@@ -88,6 +117,8 @@ def _resolve_filename(player: Player, primary_path: str) -> str:
 
     chosen = ""
     chosen_source = ""
+
+    # 1. Cheap pass: URL query params and basenames-with-video-extension.
     for src, val in sources:
         if not val or chosen:
             continue
@@ -95,7 +126,23 @@ def _resolve_filename(player: Player, primary_path: str) -> str:
         if found:
             chosen, chosen_source = found, src
 
-    # Fallback: any candidate that's a local-looking path with a video ext.
+    # 2. Network pass: ask each unique URL for its Content-Disposition.
+    # Necessary for debrid CDNs (TorBox) that drop the filename= query param
+    # by the time the URL reaches Kodi but still serve it in headers.
+    if not chosen:
+        probed = []
+        for src, val in sources:
+            if not val or "://" not in val or val.startswith("file://"):
+                continue
+            if val in probed:
+                continue
+            probed.append(val)
+            found = _filename_from_headers(val)
+            if found:
+                chosen, chosen_source = found, "{} → Content-Disposition".format(src)
+                break
+
+    # 3. Local-looking path with a video extension.
     if not chosen:
         for src, val in sources:
             if not val:
