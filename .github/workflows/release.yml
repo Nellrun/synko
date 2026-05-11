@@ -2,7 +2,7 @@ name: Build & publish Kodi repo
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
     paths:
       - 'addon.xml'
       - 'addon.py'
@@ -35,32 +35,41 @@ jobs:
       - name: Read addon version
         id: meta
         run: |
+          set -eux
           ver=$(grep -m1 'version=' addon.xml | sed -E 's/.*version="([^"]+)".*/\1/')
+          test -n "$ver"
           echo "version=$ver" >> "$GITHUB_OUTPUT"
-          echo "Building $ADDON_ID v$ver"
 
       - name: Build addon zip
         run: |
-          VER=${{ steps.meta.outputs.version }}
-          mkdir -p staging/$ADDON_ID
-          rsync -a \
-            --exclude='.git' \
-            --exclude='.github' \
-            --exclude='dist' \
-            --exclude='staging*' \
-            --exclude='*.zip' \
-            --exclude='.gitignore' \
-            ./ staging/$ADDON_ID/
-          mkdir -p dist/$ADDON_ID
-          (cd staging && zip -r ../dist/$ADDON_ID/$ADDON_ID-$VER.zip $ADDON_ID)
-          cp addon.xml dist/$ADDON_ID/addon.xml
-          cp resources/icon.png dist/$ADDON_ID/icon.png 2>/dev/null || true
-          cp resources/fanart.png dist/$ADDON_ID/fanart.png 2>/dev/null || true
+          set -eux
+          VER="${{ steps.meta.outputs.version }}"
+
+          # Stage just the addon files; skip everything that doesn't belong.
+          rm -rf staging dist
+          mkdir -p "staging/$ADDON_ID"
+          shopt -s extglob dotglob
+          for f in !(.git|.github|.gitignore|dist|staging|*.zip); do
+            cp -r "$f" "staging/$ADDON_ID/"
+          done
+          shopt -u dotglob
+          ls -la "staging/$ADDON_ID/"
+
+          mkdir -p "dist/$ADDON_ID"
+          ( cd staging && zip -r "../dist/$ADDON_ID/$ADDON_ID-$VER.zip" "$ADDON_ID" )
+          cp addon.xml "dist/$ADDON_ID/addon.xml"
+          [ -f resources/icon.png ] && cp resources/icon.png "dist/$ADDON_ID/icon.png" || true
+          [ -f resources/fanart.png ] && cp resources/fanart.png "dist/$ADDON_ID/fanart.png" || true
+
+          echo "---- dist after addon build ----"
+          ls -laR dist
 
       - name: Build repository addon
         run: |
-          mkdir -p staging-repo/$REPO_ID
-          cat > staging-repo/$REPO_ID/addon.xml <<EOF
+          set -eux
+          rm -rf staging-repo
+          mkdir -p "staging-repo/$REPO_ID"
+          cat > "staging-repo/$REPO_ID/addon.xml" <<XML
           <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
           <addon id="$REPO_ID" name="Nellrun Synko Repo" version="$REPO_VER" provider-name="nellrun">
             <extension point="xbmc.addon.repository" name="Nellrun Synko Repo">
@@ -76,23 +85,35 @@ jobs:
               <platform>all</platform>
             </extension>
           </addon>
-          EOF
-          mkdir -p dist/$REPO_ID
-          (cd staging-repo && zip -r ../dist/$REPO_ID/$REPO_ID-$REPO_VER.zip $REPO_ID)
-          cp staging-repo/$REPO_ID/addon.xml dist/$REPO_ID/addon.xml
+          XML
+          mkdir -p "dist/$REPO_ID"
+          ( cd staging-repo && zip -r "../dist/$REPO_ID/$REPO_ID-$REPO_VER.zip" "$REPO_ID" )
+          cp "staging-repo/$REPO_ID/addon.xml" "dist/$REPO_ID/addon.xml"
 
       - name: Generate addons.xml + md5
         run: |
+          set -eux
           {
             echo '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             echo '<addons>'
-            sed -n '/<addon /,/<\/addon>/p' dist/$ADDON_ID/addon.xml
-            sed -n '/<addon /,/<\/addon>/p' dist/$REPO_ID/addon.xml
+            sed -n '/<addon /,/<\/addon>/p' "dist/$ADDON_ID/addon.xml"
+            sed -n '/<addon /,/<\/addon>/p' "dist/$REPO_ID/addon.xml"
             echo '</addons>'
           } > dist/addons.xml
           md5sum dist/addons.xml | awk '{print $1}' > dist/addons.xml.md5
+
+          echo "---- final dist tree ----"
+          ls -laR dist
           echo "---- addons.xml ----"
           cat dist/addons.xml
+
+      - name: Verify zips made it into dist
+        run: |
+          set -eux
+          VER="${{ steps.meta.outputs.version }}"
+          test -f "dist/$ADDON_ID/$ADDON_ID-$VER.zip"
+          test -f "dist/$REPO_ID/$REPO_ID-$REPO_VER.zip"
+          du -h dist/**/*.zip
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
